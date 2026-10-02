@@ -20,6 +20,10 @@ export const getFriendSuggestions = async (req: Request, res: Response) => {
     isDeactivated: { $ne: true },
     blockedUsers: { $ne: user.id }, // exclude users who blocked me
   })
+    // coverPhoto can be a large base64 string and is never shown in a
+    // suggestion card - don't ship it. This endpoint is polled by the Friends
+    // page, so the saving compounds.
+    .select('-coverPhoto')
     .limit(50)
     .lean();
 
@@ -35,7 +39,11 @@ export const getFriendsList = async (req: Request, res: Response) => {
   const myFriendIds = toIdStringArray(user.friends);
   const myBlocked = toIdStringArray(user.blockedUsers);
 
-  const friendDocs = await User.find({ _id: { $in: myFriendIds }, isDeactivated: { $ne: true } }).lean();
+  // Exclude coverPhoto: it can be a large base64 string per friend, which
+  // made this heavily-polled endpoint's response grow to megabytes.
+  const friendDocs = await User.find({ _id: { $in: myFriendIds }, isDeactivated: { $ne: true } })
+    .select('-coverPhoto')
+    .lean();
   const friends = friendDocs.filter((u: any) => {
     const uId = u._id.toString();
     const theirBlocked = toIdStringArray(u.blockedUsers);
@@ -48,7 +56,7 @@ export const getFriendsList = async (req: Request, res: Response) => {
 export const getFriendRequests = async (req: Request, res: Response) => {
   const user = req.user!;
   const [received, sent] = await Promise.all([
-    notificationService.listForUser(user.id, { limit: 200 }).then(list => list.filter(n => n.type === 'friend_request')),
+    notificationService.listForUser(user.id, { limit: 200, types: ['friend_request'] }),
     Notification.find({ senderId: user.id, type: 'friend_request' }).populate('recipientId', 'username profilePic verifyBadge').lean(),
   ]);
 
@@ -328,7 +336,7 @@ export const unblockUser = async (req: Request, res: Response) => {
 export const getBlockedUsers = async (req: Request, res: Response) => {
   const user = req.user!;
   const blockedIds = toIdStringArray(user.blockedUsers);
-  const blockedDocs = await User.find({ _id: { $in: blockedIds } }).lean();
+  const blockedDocs = await User.find({ _id: { $in: blockedIds } }).select('-coverPhoto').lean();
   const sanitized = await Promise.all(blockedDocs.map(async (u: any) => {
     const apiUser: any = await userService.toApiUser(u);
     delete apiUser.passwordHash;

@@ -74,7 +74,7 @@ npm run lint     # tsc --noEmit — type-check without emitting files
 | `PORT`         | Port the API listens on (default `3000`)                       |
 | `MONGODB_URI`  | MongoDB Atlas connection string (required — no fallback)       |
 | `JWT_SECRET`   | Secret used to sign session tokens                               |
-| `SMTP_HOST/PORT/USER/PASS/FROM` | Used to send real verification/reset emails; if unset, codes are logged to the console instead |
+| `SMTP_HOST/PORT/USER/PASS/FROM` | Used to send password-reset code emails (signup no longer requires email verification) |
 | `CORS_ORIGIN`  | Comma-separated list of allowed Frontend origins, or `*` for any |
 
 ## Database design notes

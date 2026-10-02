@@ -42,12 +42,18 @@ export const notificationService = {
     return Notification.create({ recipientId, senderId: null, senderName, senderAvatar, type, message, relatedId });
   },
 
-  async listForUser(recipientId: string, { page = 1, limit = 50 }: { page?: number; limit?: number } = {}) {
+  async listForUser(
+    recipientId: string,
+    { page = 1, limit = 50, types }: { page?: number; limit?: number; types?: string[] } = {}
+  ) {
     const skip = (page - 1) * limit;
-    // 'message' notifications are intentionally excluded: message activity
-    // must only ever appear inside the Messenger section, never in the
-    // shared notification bell/panel.
-    const docs = await Notification.find({ recipientId, type: { $ne: 'message' } })
+    // 'message' notifications are excluded by default: message activity must
+    // only ever appear inside the Messenger section, never in the shared
+    // notification bell/panel. Callers that only care about one category (e.g.
+    // friend requests) can pass `types` so the rest is filtered out by the
+    // database instead of fetched-then-filtered in application code.
+    const typeFilter = types && types.length > 0 ? { $in: types } : { $ne: 'message' };
+    const docs = await Notification.find({ recipientId, type: typeFilter })
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit)

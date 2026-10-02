@@ -26,6 +26,9 @@ const NotificationSchema = new Schema({
 
 NotificationSchema.index({ recipientId: 1, createdAt: -1 });
 NotificationSchema.index({ recipientId: 1, isRead: 1 });
+// Supports the "have I already sent/received a friend request from X" lookups
+// and the sent-requests list, which filter by senderId + type.
+NotificationSchema.index({ senderId: 1, recipientId: 1, type: 1 });
 
 NotificationSchema.plugin(idPlugin);
 

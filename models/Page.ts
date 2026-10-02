@@ -17,6 +17,9 @@ const PageSchema = new Schema({
   invitees: [{ type: Types.ObjectId, ref: 'User' }],
 }, { timestamps: { createdAt: 'createdAt', updatedAt: false } });
 
+// getPages lists every page sorted by newest first.
+PageSchema.index({ createdAt: -1 });
+
 PageSchema.plugin(idPlugin);
 
 export default (mongoose.models.Page as any) || mongoose.model('Page', PageSchema);

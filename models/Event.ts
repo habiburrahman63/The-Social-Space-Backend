@@ -20,6 +20,10 @@ const EventSchema = new Schema({
   isOfficial: { type: Boolean, default: false },
 }, { timestamps: { createdAt: 'createdAt', updatedAt: false } });
 
+// getEvents lists every event sorted by newest first - without this the sort
+// is done in memory after a full collection scan.
+EventSchema.index({ createdAt: -1 });
+
 EventSchema.plugin(idPlugin);
 
 export default (mongoose.models.Event as any) || mongoose.model('Event', EventSchema);

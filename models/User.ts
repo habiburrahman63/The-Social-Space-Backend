@@ -14,7 +14,11 @@ const SocialLinksSchema = new Schema({
 }, { _id: false });
 
 const UserSchema = new Schema({
-  username: { type: String, required: true, trim: true },
+  // Usernames are a public handle (profile identity, @tags inside posts, friend
+  // suggestions), so duplicates would silently break all of those. Enforced by
+  // a unique index as well as an explicit check in the register controller, so
+  // two simultaneous signups can't slip through the pre-check.
+  username: { type: String, required: true, trim: true, unique: true },
   email: { type: String, required: true, unique: true, lowercase: true, trim: true, index: true },
   passwordHash: { type: String, required: true },
 
@@ -61,7 +65,10 @@ const UserSchema = new Schema({
   lastActiveAt: String,
 }, { timestamps: { createdAt: 'createdAt', updatedAt: false } });
 
-UserSchema.index({ username: 'text' });
+// The old `{ username: 'text' }` index was removed here: no query ever used
+// $text against User (search is a client-side filter over
+// /friends/suggestions), and the unique b-tree index on username both enforces
+// uniqueness and speeds up the exact-match `$in` lookups used for post @tags.
 
 UserSchema.plugin(idPlugin);
 

@@ -39,17 +39,34 @@ export async function authenticateToken(req: Request, res: Response, next: NextF
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET) as { userId: string; email: string };
-    const user = await User.findById(decoded.userId).catch(() => null);
+    // This runs on EVERY authenticated request, so:
+    //  1. Only pull the exact fields the controllers read off req.user
+    //     (id/username/avatar/badge/role/friends/blockedUsers/status flags).
+    //     A base64 cover photo or featuredPhotos entry can be hundreds of KB
+    //     and is never needed here - shipping it from MongoDB on every request
+    //     (and every Frontend poll) was pure overhead.
+    //  2. Use .lean() so the document isn't hydrated into a full Mongoose
+    //     object on every request - controllers only read plain properties.
+    // Endpoints that must return the heavy fields (e.g. /auth/me, profile
+    // updates) re-fetch the full document themselves.
+    const user: any = await User.findById(decoded.userId)
+      .select('username profilePic verifyBadge role friends blockedUsers isLocked isDeactivated lastActiveAt')
+      .lean()
+      .catch(() => null);
 
     if (!user) {
       return res.status(403).json({ error: 'User no longer exists' });
     }
 
-    if (user.get('isLocked')) {
+    // .lean() results don't run the idPlugin virtual, so expose the same
+    // string `id` the rest of the codebase (and Frontend) expects.
+    user.id = user._id.toString();
+
+    if (user.isLocked) {
       return res.status(403).json({ error: 'Account is locked. Please reset your password.' });
     }
 
-    if (user.get('isDeactivated')) {
+    if (user.isDeactivated) {
       return res.status(403).json({ error: 'Account is deactivated' });
     }
 
@@ -57,19 +74,18 @@ export async function authenticateToken(req: Request, res: Response, next: NextF
     // response on this write. With the Frontend polling several endpoints
     // every few seconds, awaiting a full document save on every single
     // authenticated request was adding a network round-trip to MongoDB to
-    // every request and creating heavy, unnecessary write load - this was
-    // the main cause of the app feeling slow.
+    // every request and creating heavy, unnecessary write load.
     //
     // The threshold here must stay well under the Frontend's 20-second
     // "online" cutoff (utils/presence.ts isUserOnline) or active users start
     // intermittently showing as offline between writes.
-    const lastActive = user.get('lastActiveAt');
+    const lastActive = user.lastActiveAt;
     const isStale = !lastActive || Date.now() - new Date(lastActive).getTime() > 10_000;
     if (isStale) {
       User.updateOne({ _id: user.id }, { $set: { lastActiveAt: new Date().toISOString() } }).catch(() => {});
     }
 
-    req.user = user as any;
+    req.user = user;
     next();
   } catch (err) {
     return res.status(403).json({ error: 'Invalid or expired session token' });

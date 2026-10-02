@@ -45,6 +45,13 @@ export const userService = {
       delete json.__v;
     }
 
+    // Sensitive fields must never leave the server, whichever endpoint
+    // serializes a user. Previously a couple of callers forgot to delete
+    // passwordHash, so it leaked through /api/friends/list and
+    // /api/friends/suggestions. Doing it here fixes every caller at once.
+    delete json.passwordHash;
+    delete json.otpSecret;
+
     // postsCount isn't rendered anywhere in the Frontend today (Profile.tsx
     // computes its own count from the posts it fetches), so skip the extra
     // Post.countDocuments() query by default - this function gets called in
@@ -71,13 +78,19 @@ export const userService = {
 
   async checkBlocked(userId1: string, userId2: string): Promise<boolean> {
     if (!userId1 || !userId2) return false;
-    const [user1, user2] = await Promise.all([
-      User.findById(userId1).lean().catch(() => null),
-      User.findById(userId2).lean().catch(() => null),
-    ]);
-    if (!user1 || !user2) return false;
-    const blockedBy1 = toIdStringArray((user1 as any).blockedUsers);
-    const blockedBy2 = toIdStringArray((user2 as any).blockedUsers);
-    return blockedBy1.includes(userId2) || blockedBy2.includes(userId1);
+    // One query for both users instead of two separate findById round-trips.
+    // This runs on every message send, friend request, story view and
+    // notification, so halving the round-trips matters. An invalid ObjectId
+    // makes the $in cast throw, which we treat the same as "no block" (the
+    // previous per-id findById().catch(() => null) behaviour).
+    const docs = await User.find({ _id: { $in: [userId1, userId2] } })
+      .select('blockedUsers')
+      .lean()
+      .catch(() => []);
+    if (!docs || docs.length === 0) return false;
+    const byId = new Map<string, string[]>(
+      (docs as any[]).map((d) => [d._id.toString(), toIdStringArray(d.blockedUsers)]),
+    );
+    return (byId.get(userId1) || []).includes(userId2) || (byId.get(userId2) || []).includes(userId1);
   },
 };

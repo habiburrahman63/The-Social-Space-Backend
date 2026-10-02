@@ -4,7 +4,7 @@
  */
 
 import { Request, Response } from 'express';
-import { Post, Comment, User } from '../models';
+import { Post, Comment, User, Notification } from '../models';
 import { userService } from '../services/userService';
 import { notificationService } from '../services/notificationService';
 import { postService } from '../services/postService';
@@ -13,7 +13,7 @@ import { escapeRegex } from '../utils/regex';
 
 export const getPosts = async (req: Request, res: Response) => {
   const user = req.user!;
-  const { filter, userId, pageId, groupId, q, page, limit } = req.query;
+  const { filter, userId, pageId, groupId, q, page, limit, includeComments, scope } = req.query;
 
   const query: any = {
     // Exclude scheduled/draft posts unless they belong to the current user.
@@ -27,15 +27,31 @@ export const getPosts = async (req: Request, res: Response) => {
   else if (pageId) query.location = `Page:${pageId}`;
   else if (groupId) query.location = `Group:${groupId}`;
 
+  // Conditions that must hold in addition to the top-level $or above.
+  const andClauses: any[] = [];
   if (q) {
     const regex = new RegExp(escapeRegex(String(q)), 'i');
-    query.$and = [{ $or: [{ text: regex }, { hashtags: regex }] }];
+    andClauses.push({ $or: [{ text: regex }, { hashtags: regex }] });
   }
 
-  // Exclude posts from users who are blocked by, or have blocked, the current user.
-  const me = await User.findById(user.id).select('blockedUsers').lean();
+  // `scope=own` returns only the current user's own draft/scheduled posts.
+  // Drafts and scheduled posts only ever belong to their author, so the Feed
+  // uses this to keep its Drafts/Scheduled tabs accurate independently of how
+  // many feed pages it has loaded.
+  if (scope === 'own') {
+    query.userId = user.id;
+    andClauses.push({ $or: [{ isDraft: true }, { scheduledTime: { $nin: [null, ''] } }] });
+  }
+  if (andClauses.length) query.$and = andClauses;
+
+  // Exclude posts from users who are blocked by, or have blocked, the current
+  // user. Both lookups are independent, so run them in parallel instead of as
+  // two sequential round-trips on every feed load.
+  const [me, blockedByOthers] = await Promise.all([
+    User.findById(user.id).select('blockedUsers').lean(),
+    User.find({ blockedUsers: user.id }).select('_id').lean(),
+  ]);
   const myBlocked = toIdStringArray((me as any)?.blockedUsers);
-  const blockedByOthers = await User.find({ blockedUsers: user.id }).select('_id').lean();
   const excludeIds = [...myBlocked, ...blockedByOthers.map((u: any) => u._id.toString())];
   if (excludeIds.length) query.userId = { ...(query.userId ? { $eq: query.userId } : {}), $nin: excludeIds };
 
@@ -48,12 +64,33 @@ export const getPosts = async (req: Request, res: Response) => {
     .skip(skip)
     .limit(limitNum)
     .populate('userId', 'username profilePic verifyBadge')
-    .populate('pollOptions.votes', 'id')
+    // NOTE: pollOptions.votes is deliberately NOT populated - serializePostsBatch
+    // only needs the voter ids, and toIdStringArray already handles raw
+    // ObjectIds, so populating them was an extra query per feed load for data
+    // that gets flattened away anyway.
     .lean();
 
-  const enrichedPosts = await postService.serializePostsBatch(posts);
+  // `includeComments=0` lets a list view fetch just the posts (plus a comment
+  // count) and load one post's comments only when its comment tray is opened.
+  // It defaults to true, so existing consumers (e.g. the Profile page) are
+  // completely unaffected.
+  const withComments = includeComments !== '0' && includeComments !== 'false';
+  const enrichedPosts = await postService.serializePostsBatch(posts, { withComments });
 
   return res.json({ posts: enrichedPosts, page: pageNum, limit: limitNum, hasMore: posts.length === limitNum });
+};
+
+/**
+ * Comments for a single post, fetched on demand by the Feed when a post's
+ * comment tray is opened. The shape is identical to the `comments` field the
+ * posts list already returns, so merging it is a straight assignment.
+ */
+export const getPostComments = async (req: Request, res: Response) => {
+  const exists = await Post.findById(req.params.id).select('_id').lean().catch(() => null);
+  if (!exists) return res.status(404).json({ error: 'Post not found' });
+
+  const comments = await postService.getCommentsForPost(req.params.id);
+  return res.json({ comments, commentsCount: comments.length });
 };
 
 export const createPost = async (req: Request, res: Response) => {
@@ -81,20 +118,40 @@ export const createPost = async (req: Request, res: Response) => {
     pollOptions: pollOptions ? pollOptions.map((opt: string) => ({ text: opt, votes: [] })) : undefined,
   });
 
+  // Who is allowed to receive a notification from this user? Fetching every
+  // recipient's block list in one query and inserting all notifications in a
+  // single batch replaces the previous per-recipient loop, which cost 3
+  // sequential database round-trips per friend (notifyUser -> checkBlocked ->
+  // 2 reads). For anyone with a real friend list that made posting slow.
+  const eligibleRecipientIds = (docs: any[]): any[] => {
+    const myBlocked = new Set(toIdStringArray(user.blockedUsers));
+    return docs
+      .filter((d) => {
+        const id = d._id.toString();
+        if (id === user.id) return false;
+        if (myBlocked.has(id)) return false;
+        if (toIdStringArray(d.blockedUsers).includes(user.id)) return false;
+        return true;
+      })
+      .map((d) => d._id);
+  };
+
   // Notify tagged friends
   if (tags && tags.length > 0) {
-    const taggedUsers = await User.find({ username: { $in: tags } }).select('_id username').lean();
-    for (const taggedUser of taggedUsers as any[]) {
-      const taggedId = taggedUser._id.toString();
-      if (taggedId !== user.id) {
-        await notificationService.notifyUser({
-          recipientId: taggedId,
+    const taggedUsers = await User.find({ username: { $in: tags } })
+      .select('blockedUsers')
+      .lean();
+    const tagRecipients = eligibleRecipientIds(taggedUsers as any[]);
+    if (tagRecipients.length > 0) {
+      await Notification.insertMany(
+        tagRecipients.map((recipientId) => ({
+          recipientId,
           senderId: user.id,
           type: 'tag',
           message: 'tagged you in a post',
           relatedId: newPostDoc.id,
-        });
-      }
+        }))
+      );
     }
   }
 
@@ -103,14 +160,22 @@ export const createPost = async (req: Request, res: Response) => {
   // 'post' notification type shown only in the Home section on the Frontend.
   if (!isDraft && !scheduledTime && (privacy || 'Public') !== 'Only Me') {
     const friendIds = toIdStringArray(user.friends);
-    for (const friendId of friendIds) {
-      await notificationService.notifyUser({
-        recipientId: friendId,
-        senderId: user.id,
-        type: 'post',
-        message: 'shared a new post',
-        relatedId: newPostDoc.id,
-      });
+    if (friendIds.length > 0) {
+      const friends = await User.find({ _id: { $in: friendIds } })
+        .select('blockedUsers')
+        .lean();
+      const postRecipients = eligibleRecipientIds(friends as any[]);
+      if (postRecipients.length > 0) {
+        await Notification.insertMany(
+          postRecipients.map((recipientId) => ({
+            recipientId,
+            senderId: user.id,
+            type: 'post',
+            message: 'shared a new post',
+            relatedId: newPostDoc.id,
+          }))
+        );
+      }
     }
   }
 

@@ -19,7 +19,10 @@ export const getAdminMetrics = async (req: Request, res: Response) => {
       MarketplaceItem.countDocuments(),
       Group.countDocuments(),
       Page.countDocuments(),
-      User.find().select('-passwordHash').lean(),
+      // NOTE: coverPhoto is deliberately excluded - it can be a base64 data
+      // URI per user and is never rendered in the admin table, so including
+      // it made this full-user-list response enormous.
+      User.find().select('-passwordHash -coverPhoto').lean(),
       Report.find().lean(),
       authService.getSettings(),
     ]);
@@ -36,7 +39,7 @@ export const getAdminUsers = async (req: Request, res: Response) => {
   const user = req.user!;
   if (user.role !== 'admin') return res.status(403).json({ error: 'Admin only action' });
 
-  const users = await User.find().select('-passwordHash').lean();
+  const users = await User.find().select('-passwordHash -coverPhoto').lean();
   return res.json({ users: users.map((u: any) => ({ ...u, id: u._id.toString(), _id: undefined })) });
 };
 

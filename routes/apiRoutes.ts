@@ -5,7 +5,7 @@
 
 import { createRouter } from '../utils/createRouter';
 import { authenticateToken } from '../middleware/auth';
-import { getPosts, createPost, updatePost, deletePost, reactToPost, commentOnPost, voteOnPoll } from '../controllers/postController';
+import { getPosts, getPostComments, createPost, updatePost, deletePost, reactToPost, commentOnPost, voteOnPoll } from '../controllers/postController';
 import { getFriendSuggestions, getFriendsList, getFriendRequests, getUserById, sendFriendRequest, cancelFriendRequest, acceptFriendRequest, rejectFriendRequest, unfriendUser, followUser, unfollowUser, blockUser, unblockUser, getBlockedUsers } from '../controllers/friendController';
 import { getMessageContacts, getUnreadMessageCount, getConversation, setTypingStatus, getTypingStatus, sendMessage, deleteMessage } from '../controllers/messageController';
 import { getStories, createStory, viewStory } from '../controllers/storyController';
@@ -20,6 +20,7 @@ import { getAdminMetrics, getAdminUsers, getAdminReports, toggleUserLock, toggle
 const apiRouter = createRouter();
 
 apiRouter.get('/posts', authenticateToken, getPosts);
+apiRouter.get('/posts/:id/comments', authenticateToken, getPostComments);
 apiRouter.post('/posts', authenticateToken, createPost);
 apiRouter.put('/posts/:id', authenticateToken, updatePost);
 apiRouter.delete('/posts/:id', authenticateToken, deletePost);

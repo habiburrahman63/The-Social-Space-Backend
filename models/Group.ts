@@ -14,6 +14,9 @@ const GroupSchema = new Schema({
   creatorId: { type: Types.ObjectId, ref: 'User', required: true, index: true },
 }, { timestamps: { createdAt: 'createdAt', updatedAt: false } });
 
+// getGroups lists every group sorted by newest first.
+GroupSchema.index({ createdAt: -1 });
+
 GroupSchema.plugin(idPlugin);
 
 export default (mongoose.models.Group as any) || mongoose.model('Group', GroupSchema);

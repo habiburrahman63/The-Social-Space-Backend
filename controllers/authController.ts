@@ -11,11 +11,30 @@ import { User } from '../models';
 import { userService } from '../services/userService';
 import { authService } from '../services/authService';
 import { notificationService } from '../services/notificationService';
-import { JWT_SECRET, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM } from '../config/env';
+import { JWT_SECRET, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM, IS_PRODUCTION } from '../config/env';
+
+// Reused across requests. nodemailer's pooled transport keeps a few SMTP
+// connections open, so register/reset emails don't pay TCP + TLS + AUTH
+// setup on every send (previously a brand-new transport was created per
+// call, adding seconds to those endpoints).
+let mailTransporter: nodemailer.Transporter | null = null;
+function getMailTransporter(): nodemailer.Transporter {
+  if (!mailTransporter) {
+    mailTransporter = nodemailer.createTransport({
+      host: SMTP_HOST,
+      port: SMTP_PORT,
+      secure: SMTP_PORT === 465,
+      auth: { user: SMTP_USER, pass: SMTP_PASS },
+      pool: true,
+      maxConnections: 3,
+      maxMessages: 100,
+    });
+  }
+  return mailTransporter;
+}
 
 async function sendVerificationEmail(toEmail: string, code: string): Promise<{ success: boolean; error?: string }> {
   const host = SMTP_HOST;
-  const port = SMTP_PORT;
   const user = SMTP_USER;
   const pass = SMTP_PASS;
   const from = SMTP_FROM;
@@ -29,12 +48,7 @@ async function sendVerificationEmail(toEmail: string, code: string): Promise<{ s
   }
 
   try {
-    const transporter = nodemailer.createTransport({
-      host,
-      port,
-      secure: port === 465,
-      auth: { user, pass },
-    });
+    const transporter = getMailTransporter();
 
     const mailOptions = {
       from,
@@ -72,43 +86,18 @@ async function sendVerificationEmail(toEmail: string, code: string): Promise<{ s
   }
 }
 
-export const sendVerificationCode = async (req: Request, res: Response) => {
-  const { email } = req.body;
-  if (!email) return res.status(400).json({ error: 'Email is required' });
-
-  const lowerEmail = email.toLowerCase().trim();
-  if (!lowerEmail.includes('@')) return res.status(400).json({ error: 'Invalid email address' });
-
-  const existing = await userService.findByEmail(lowerEmail);
-  if (existing) return res.status(400).json({ error: 'An account with this email already exists' });
-
-  const cooldownRemaining = await authService.getResendCooldownRemaining(lowerEmail, 'register');
-  if (cooldownRemaining > 0) {
-    return res.status(429).json({
-      error: `Please wait ${Math.ceil(cooldownRemaining / 1000)} seconds before requesting another code.`,
-      retryAfterMs: cooldownRemaining,
-    });
-  }
-
-  const code = Math.floor(100000 + Math.random() * 900000).toString();
-
-  const sendResult = await sendVerificationEmail(lowerEmail, code);
-  if (!sendResult.success) {
-    // Never tell the user the email was sent when it wasn't, and never
-    // create/refresh a verification record for a code that never reached them.
-    return res.status(502).json({ error: sendResult.error || 'Failed to send verification email. Please try again shortly.' });
-  }
-
-  await authService.setVerificationCode(lowerEmail, code, Date.now() + 10 * 60 * 1000, 'register');
-
-  return res.json({
-    success: true,
-    message: 'Verification code has been sent to your email address!',
-  });
+// The token cookie is a secondary auth path - the SPA primarily authenticates
+// with the Authorization header from localStorage. It is httpOnly, and in
+// production it is only sent over HTTPS with SameSite=Lax protection.
+const TOKEN_COOKIE_OPTIONS = {
+  httpOnly: true,
+  maxAge: 7 * 24 * 60 * 60 * 1000,
+  sameSite: 'lax' as const,
+  secure: IS_PRODUCTION,
 };
 
 export const register = async (req: Request, res: Response) => {
-  const { username, email, password, gender, birthday, code } = req.body;
+  const { username, email, password, gender, birthday } = req.body;
 
   if (!username || !email || !password) {
     return res.status(400).json({ error: 'Username, email, and password are required' });
@@ -116,37 +105,33 @@ export const register = async (req: Request, res: Response) => {
   if (password.length < 6) {
     return res.status(400).json({ error: 'Password must be at least 6 characters long' });
   }
-  if (!code) {
-    return res.status(400).json({ error: 'Email verification code is required. Please verify your email first.' });
-  }
 
+  const cleanUsername = String(username).trim();
   const lowerEmail = email.toLowerCase().trim();
-  const existing = await userService.findByEmail(lowerEmail);
-  if (existing) return res.status(400).json({ error: 'An account with this email already exists' });
+  if (!lowerEmail.includes('@')) return res.status(400).json({ error: 'Invalid email address' });
+  if (!cleanUsername) return res.status(400).json({ error: 'Username cannot be empty' });
 
-  const saved = await authService.getVerificationCode(lowerEmail, 'register');
-  if (!saved) return res.status(400).json({ error: 'No verification session found. Please request a new code.' });
-  if (Date.now() > saved.expires) {
-    await authService.deleteVerificationCode(lowerEmail, 'register');
-    return res.status(400).json({ error: 'Verification code has expired. Please request a new code.' });
-  }
-  if (saved.code !== code.trim()) {
-    const { locked } = await authService.registerFailedAttempt(lowerEmail, 'register');
-    if (locked) {
-      return res.status(400).json({ error: 'Too many incorrect attempts. Please request a new verification code.' });
-    }
-    return res.status(400).json({ error: 'Incorrect verification code. Please check and try again.' });
-  }
-  await authService.deleteVerificationCode(lowerEmail, 'register');
+  // Email and username uniqueness are independent checks - run them together
+  // rather than one after the other.
+  const [existingEmail, existingUsername] = await Promise.all([
+    userService.findByEmail(lowerEmail),
+    User.exists({ username: cleanUsername }),
+  ]);
+  if (existingEmail) return res.status(400).json({ error: 'An account with this email already exists.' });
+  if (existingUsername) return res.status(400).json({ error: 'That username is already taken. Please choose another one.' });
 
-  const salt = bcrypt.genSaltSync(10);
-  const passwordHash = bcrypt.hashSync(password, salt);
+  // Async bcrypt: the sync variants block the entire Node event loop for the
+  // whole hash (cost 10), which on a small Render instance stalls every other
+  // in-flight request. The async form yields between rounds instead.
+  const passwordHash = await bcrypt.hash(password, 10);
 
-  const newUser = await User.create({
-    username,
+  let newUser;
+  try {
+    newUser = await User.create({
+    username: cleanUsername,
     email: lowerEmail,
     passwordHash,
-    profilePic: `https://api.dicebear.com/7.x/adventurer/svg?seed=${encodeURIComponent(username)}`,
+    profilePic: `https://api.dicebear.com/7.x/adventurer/svg?seed=${encodeURIComponent(cleanUsername)}`,
     coverPhoto: 'https://images.unsplash.com/photo-1557683316-973673baf926?w=800',
     bio: 'Hello world, I just joined the network!',
     relationship: 'Single',
@@ -160,11 +145,27 @@ export const register = async (req: Request, res: Response) => {
     role: 'user',
     failedLoginAttempts: 0,
     isLocked: false,
-  });
+    });
+  } catch (err: any) {
+    // Two simultaneous signups with the same email or username can both pass
+    // the pre-checks above; the unique indexes reject the second one. Report
+    // which field collided so the user gets an actionable message.
+    if (err?.code === 11000) {
+      if (err?.keyPattern && 'username' in err.keyPattern) {
+        return res.status(400).json({ error: 'That username is already taken. Please choose another one.' });
+      }
+      return res.status(400).json({ error: 'An account with this email already exists.' });
+    }
+    throw err;
+  }
 
   const token = jwt.sign({ userId: newUser.id, email: newUser.get('email') }, JWT_SECRET, { expiresIn: '7d' });
 
-  await authService.recordSession(newUser.id, String(req.headers['user-agent'] || 'Unknown Device'), req.ip || '127.0.0.1', 'success');
+  // The session audit-log write isn't needed for the response, so keep it off
+  // the critical path instead of making the user wait on an extra round-trip.
+  authService
+    .recordSession(newUser.id, String(req.headers['user-agent'] || 'Unknown Device'), req.ip || '127.0.0.1', 'success')
+    .catch(() => {});
 
   await notificationService.notifySystem({
     recipientId: newUser.id,
@@ -174,7 +175,7 @@ export const register = async (req: Request, res: Response) => {
     message: 'Welcome to our social network! Complete your profile to connect with friends.',
   });
 
-  res.cookie('token', token, { httpOnly: true, maxAge: 7 * 24 * 60 * 60 * 1000 });
+  res.cookie('token', token, TOKEN_COOKIE_OPTIONS);
 
   const apiUser = await userService.toApiUser(newUser);
   delete (apiUser as any).passwordHash;
@@ -192,14 +193,16 @@ export const login = async (req: Request, res: Response) => {
     return res.status(403).json({ error: 'Your account is locked due to multiple failed login attempts. Please reset your password.' });
   }
 
-  const isValid = bcrypt.compareSync(password, user.get('passwordHash'));
+  const isValid = await bcrypt.compare(password, user.get('passwordHash'));
   const device = String(req.headers['user-agent'] || 'Unknown Device');
   const ip = req.ip || '127.0.0.1';
 
   if (!isValid) {
     const attempts = (user.get('failedLoginAttempts') || 0) + 1;
     user.set('failedLoginAttempts', attempts);
-    await authService.recordSession(user.id, device, ip, 'failed');
+    // Audit log only - don't let a write add latency to the failure response,
+    // since this path can be hit repeatedly by a brute-force attempt.
+    authService.recordSession(user.id, device, ip, 'failed').catch(() => {});
 
     if (attempts >= 5) {
       user.set('isLocked', true);
@@ -214,10 +217,10 @@ export const login = async (req: Request, res: Response) => {
   if (user.get('isDeactivated')) user.set('isDeactivated', false);
   user.set('failedLoginAttempts', 0);
   await user.save();
-  await authService.recordSession(user.id, device, ip, 'success');
+  authService.recordSession(user.id, device, ip, 'success').catch(() => {});
 
   const token = jwt.sign({ userId: user.id, email: user.get('email') }, JWT_SECRET, { expiresIn: '7d' });
-  res.cookie('token', token, { httpOnly: true, maxAge: 7 * 24 * 60 * 60 * 1000 });
+  res.cookie('token', token, TOKEN_COOKIE_OPTIONS);
 
   const apiUser = await userService.toApiUser(user);
   delete (apiUser as any).passwordHash;
@@ -225,12 +228,15 @@ export const login = async (req: Request, res: Response) => {
 };
 
 export const logout = (req: Request, res: Response) => {
-  res.clearCookie('token');
+  res.clearCookie('token', { sameSite: 'lax' as const, secure: IS_PRODUCTION });
   return res.json({ success: true, message: 'Logged out successfully' });
 };
 
 export const getCurrentUser = async (req: Request, res: Response) => {
-  const apiUser: any = await userService.toApiUser(req.user!);
+  // The auth middleware omits heavy fields (coverPhoto) from req.user for
+  // every other request, so re-fetch the full document for the profile view.
+  const freshUser = await User.findById(req.user!.id).catch(() => null);
+  const apiUser: any = await userService.toApiUser(freshUser || req.user!);
   delete apiUser.passwordHash;
   return res.json({ user: apiUser });
 };
@@ -323,8 +329,7 @@ export const resetPassword = async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'Invalid verification code. Please check the code and try again.' });
   }
 
-  const salt = bcrypt.genSaltSync(10);
-  user.set('passwordHash', bcrypt.hashSync(newPassword, salt));
+  user.set('passwordHash', await bcrypt.hash(newPassword, 10));
   user.set('isLocked', false);
   user.set('failedLoginAttempts', 0);
   await authService.deleteVerificationCode(lowerEmail, 'reset');
@@ -352,11 +357,10 @@ export const updateProfile = async (req: Request, res: Response) => {
   if (!user) return res.status(404).json({ error: 'User not found' });
 
   if (currentPassword && newPassword) {
-    const isValid = bcrypt.compareSync(currentPassword, user.get('passwordHash'));
+    const isValid = await bcrypt.compare(currentPassword, user.get('passwordHash'));
     if (!isValid) return res.status(400).json({ error: 'Incorrect current password' });
     if (newPassword.length < 6) return res.status(400).json({ error: 'New password must be at least 6 characters long' });
-    const salt = bcrypt.genSaltSync(10);
-    user.set('passwordHash', bcrypt.hashSync(newPassword, salt));
+    user.set('passwordHash', await bcrypt.hash(newPassword, 10));
   }
 
   if (username) user.set('username', username);

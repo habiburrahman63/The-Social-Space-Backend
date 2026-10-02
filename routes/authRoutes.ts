@@ -6,7 +6,6 @@
 import { createRouter } from '../utils/createRouter';
 import { authenticateToken } from '../middleware/auth';
 import {
-  sendVerificationCode,
   register,
   login,
   logout,
@@ -19,7 +18,6 @@ import {
 
 const authRouter = createRouter();
 
-authRouter.post('/send-code', sendVerificationCode);
 authRouter.post('/register', register);
 authRouter.post('/login', login);
 authRouter.post('/logout', logout);

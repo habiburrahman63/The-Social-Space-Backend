@@ -18,6 +18,10 @@ const MarketplaceItemSchema = new Schema({
 
 MarketplaceItemSchema.index({ title: 'text', description: 'text' });
 
+// getMarketplaceItems lists items sorted by newest first (optionally filtered
+// by category, which already has its own index).
+MarketplaceItemSchema.index({ createdAt: -1 });
+
 MarketplaceItemSchema.plugin(idPlugin);
 
 export default (mongoose.models.MarketplaceItem as any) || mongoose.model('MarketplaceItem', MarketplaceItemSchema);

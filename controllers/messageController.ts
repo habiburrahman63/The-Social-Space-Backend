@@ -134,7 +134,13 @@ export const getConversation = async (req: Request, res: Response) => {
       { senderId: user.id, receiverId: otherUserId },
       { senderId: otherUserId, receiverId: user.id },
     ],
-  }).sort({ createdAt: 1 });
+  })
+    // Only the fields the client actually renders, and .lean() so a long
+    // conversation isn't hydrated into Mongoose documents on every poll while
+    // the chat is open.
+    .select('senderId receiverId text mediaUrl mediaType emoji gif isRead isDelivered createdAt seenAt')
+    .sort({ createdAt: 1 })
+    .lean();
 
   await Message.updateMany(
     { receiverId: user.id, senderId: otherUserId, isRead: false },

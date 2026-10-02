@@ -87,8 +87,4 @@ export const authService = {
   async recordSession(userId: string, device: string, ip: string, status: 'success' | 'failed') {
     await Session.create({ userId, device, ip, status });
   },
-
-  async getRecentSessions(userId: string, limit = 20) {
-    return Session.find({ userId }).sort({ timestamp: -1 }).limit(limit).lean();
-  },
 };
