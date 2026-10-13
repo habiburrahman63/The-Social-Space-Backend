@@ -23,10 +23,6 @@ export const getPosts = async (req: Request, res: Response) => {
     ],
   };
 
-  if (userId) query.userId = userId;
-  else if (pageId) query.location = `Page:${pageId}`;
-  else if (groupId) query.location = `Group:${groupId}`;
-
   // Conditions that must hold in addition to the top-level $or above.
   const andClauses: any[] = [];
   if (q) {
@@ -42,7 +38,6 @@ export const getPosts = async (req: Request, res: Response) => {
     query.userId = user.id;
     andClauses.push({ $or: [{ isDraft: true }, { scheduledTime: { $nin: [null, ''] } }] });
   }
-  if (andClauses.length) query.$and = andClauses;
 
   // Exclude posts from users who are blocked by, or have blocked, the current
   // user. req.user already carries the current user's blockedUsers list from
@@ -50,10 +45,58 @@ export const getPosts = async (req: Request, res: Response) => {
   const myBlocked = toIdStringArray(user.blockedUsers);
   const blockedByOthers = await User.find({ blockedUsers: user.id }).select('_id').lean();
   const excludeIds = [...myBlocked, ...blockedByOthers.map((u: any) => u._id.toString())];
-  if (excludeIds.length) query.userId = { ...(query.userId ? { $eq: query.userId } : {}), $nin: excludeIds };
 
   const pageNum = Math.max(1, parseInt(String(page || '1'), 10) || 1);
   const limitNum = Math.min(100, Math.max(1, parseInt(String(limit || '50'), 10) || 50));
+
+  if (userId) {
+    const targetUserIdStr = String(userId);
+    // If the target user is blocked or has blocked current user, return no posts
+    if (excludeIds.includes(targetUserIdStr)) {
+      return res.json({ posts: [], page: pageNum, limit: limitNum, hasMore: false });
+    }
+    query.userId = targetUserIdStr;
+
+    // Privacy access check
+    const isViewingOwnProfile = targetUserIdStr === String(user.id);
+    if (!isViewingOwnProfile) {
+      const myFriends = toIdStringArray(user.friends);
+      const isFriend = myFriends.includes(targetUserIdStr);
+      const allowedPrivacy = isFriend ? ['Public', 'Friends'] : ['Public'];
+
+      andClauses.push({
+        $or: [
+          { privacy: { $in: allowedPrivacy } },
+          { privacy: { $in: [null, undefined, ''] } },
+          { privacy: { $exists: false } }
+        ]
+      });
+    }
+  } else if (pageId) {
+    query.location = `Page:${pageId}`;
+    if (excludeIds.length) query.userId = { $nin: excludeIds };
+  } else if (groupId) {
+    query.location = `Group:${groupId}`;
+    if (excludeIds.length) query.userId = { $nin: excludeIds };
+  } else {
+    // General feed
+    if (excludeIds.length) {
+      query.userId = { $nin: excludeIds };
+    }
+    if (scope !== 'own') {
+      const myFriends = toIdStringArray(user.friends);
+      andClauses.push({
+        $or: [
+          { userId: user.id },
+          { userId: { $in: myFriends }, privacy: { $in: ['Public', 'Friends', null, undefined, ''] } },
+          { privacy: { $in: ['Public', null, undefined, ''] } },
+          { privacy: { $exists: false } }
+        ]
+      });
+    }
+  }
+
+  if (andClauses.length) query.$and = andClauses;
   const skip = (pageNum - 1) * limitNum;
 
   const posts = await Post.find(query)
