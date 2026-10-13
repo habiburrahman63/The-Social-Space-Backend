@@ -12,6 +12,7 @@ import { userService } from '../services/userService';
 import { authService } from '../services/authService';
 import { notificationService } from '../services/notificationService';
 import { JWT_SECRET, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM, IS_PRODUCTION } from '../config/env';
+import { clearUserAuthCache } from '../middleware/auth';
 
 // Reused across requests. nodemailer's pooled transport keeps a few SMTP
 // connections open, so register/reset emails don't pay TCP + TLS + AUTH
@@ -228,6 +229,7 @@ export const login = async (req: Request, res: Response) => {
 };
 
 export const logout = (req: Request, res: Response) => {
+  if (req.user?.id) clearUserAuthCache(req.user.id);
   res.clearCookie('token', { sameSite: 'lax' as const, secure: IS_PRODUCTION });
   return res.json({ success: true, message: 'Logged out successfully' });
 };
@@ -379,6 +381,7 @@ export const updateProfile = async (req: Request, res: Response) => {
   if (isDeactivated !== undefined) user.set('isDeactivated', isDeactivated);
 
   await user.save();
+  clearUserAuthCache(user.id);
 
   // NOTE: unlike the original array-based database, posts/comments/stories/
   // marketplace listings only store a `userId` reference now (no duplicated

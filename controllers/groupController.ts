@@ -6,11 +6,8 @@
 import { Request, Response } from 'express';
 import { Group, GroupMember } from '../models';
 
-async function serializeGroup(groupLean: any, membersByGroup?: Map<string, any[]>) {
+function serializeGroupObject(groupLean: any, members: any[]) {
   const groupId = (groupLean._id || groupLean.id).toString();
-  const members = membersByGroup
-    ? membersByGroup.get(groupId) || []
-    : await GroupMember.find({ groupId }).lean();
   return {
     id: groupId,
     name: groupLean.name,
@@ -18,12 +15,20 @@ async function serializeGroup(groupLean: any, membersByGroup?: Map<string, any[]
     coverPhoto: groupLean.coverPhoto,
     description: groupLean.description,
     creatorId: groupLean.creatorId?.toString ? groupLean.creatorId.toString() : groupLean.creatorId,
-    members: members.map((m: any) => m.userId.toString()),
-    admins: members.filter((m: any) => m.role === 'admin').map((m: any) => m.userId.toString()),
-    moderators: members.filter((m: any) => m.role === 'moderator').map((m: any) => m.userId.toString()),
+    members: members.map((m: any) => (m.userId?._id?.toString?.() || m.userId?.toString?.() || m.userId)),
+    admins: members.filter((m: any) => m.role === 'admin').map((m: any) => (m.userId?._id?.toString?.() || m.userId?.toString?.() || m.userId)),
+    moderators: members.filter((m: any) => m.role === 'moderator').map((m: any) => (m.userId?._id?.toString?.() || m.userId?.toString?.() || m.userId)),
     posts: [],
     createdAt: groupLean.createdAt,
   };
+}
+
+async function serializeGroup(groupLean: any, membersByGroup?: Map<string, any[]>) {
+  const groupId = (groupLean._id || groupLean.id).toString();
+  const members = membersByGroup
+    ? membersByGroup.get(groupId) || []
+    : await GroupMember.find({ groupId }).lean();
+  return serializeGroupObject(groupLean, members);
 }
 
 export const getGroups = async (req: Request, res: Response) => {
@@ -40,7 +45,13 @@ export const getGroups = async (req: Request, res: Response) => {
     membersByGroup.get(key)!.push(m);
   }
 
-  return res.json({ groups: groups.map((g) => serializeGroup(g, membersByGroup)) });
+  const serializedGroups = groups.map((g: any) => {
+    const key = (g._id || g.id).toString();
+    const members = membersByGroup.get(key) || [];
+    return serializeGroupObject(g, members);
+  });
+
+  return res.json({ groups: serializedGroups });
 };
 
 export const createGroup = async (req: Request, res: Response) => {

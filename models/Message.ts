@@ -21,7 +21,9 @@ const MessageSchema = new Schema({
 }, { timestamps: { createdAt: 'createdAt', updatedAt: false } });
 
 MessageSchema.index({ conversationId: 1, createdAt: 1 });
+MessageSchema.index({ conversationId: 1, createdAt: -1 });
 MessageSchema.index({ receiverId: 1, isRead: 1 });
+MessageSchema.index({ receiverId: 1, senderId: 1, isRead: 1 });
 // Supports the per-conversation fetch (getConversation), which filters by the
 // sender/receiver pair and sorts by createdAt - and is polled while a chat is
 // open.

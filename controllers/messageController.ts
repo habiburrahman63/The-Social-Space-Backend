@@ -20,40 +20,56 @@ export const getMessageContacts = async (req: Request, res: Response) => {
   const user = req.user!;
   const userObjectId = new mongoose.Types.ObjectId(user.id);
 
-  // Only the fields the contact list actually renders - not full user
-  // documents (bio, work, education, friends/followers arrays, etc.).
-  const allUsersPromise = User.find({}).select(CONTACT_USER_FIELDS).lean();
-
   // This user's conversations - bounded by how many people they've actually
-  // chatted with (not their total message count), and indexed on `participants`.
-  const myConversationsPromise = Conversation.find({ participants: userObjectId }).select('_id participants').lean();
-
-  const [allUsers, myConversations] = await Promise.all([allUsersPromise, myConversationsPromise]);
+  // chatted with, and indexed on `participants`.
+  const myConversations = await Conversation.find({ participants: userObjectId })
+    .select('_id participants')
+    .lean();
 
   const conversationIds = myConversations.map((c: any) => c._id);
   const partnerByConversation = new Map<string, string>();
+  const partnerIds: string[] = [];
   for (const c of myConversations as any[]) {
     const partner = toIdStringArray(c.participants).find((id) => id !== user.id);
-    if (partner) partnerByConversation.set(c._id.toString(), partner);
+    if (partner) {
+      partnerByConversation.set(c._id.toString(), partner);
+      partnerIds.push(partner);
+    }
   }
 
-  // Last message per conversation, and unread counts per sender - both
-  // computed with indexed aggregations instead of pulling this user's
-  // entire message history into memory. This stays fast whether the user
-  // has 10 messages or 100,000.
-  const [lastMessageRows, unreadRows] = conversationIds.length > 0
-    ? await Promise.all([
-        Message.aggregate([
+  // Fetch only this user's direct contacts (friends + conversation partners)
+  // and a bounded sample of suggestions, rather than loading every user
+  // document across the entire database.
+  const myFriends = toIdStringArray(user.friends);
+  const myBlocked = toIdStringArray(user.blockedUsers);
+  const neededContactIds = Array.from(new Set([...myFriends, ...partnerIds]));
+
+  const [contactUsers, suggestionUsers, lastMessageRows, unreadRows] = await Promise.all([
+    User.find({ _id: { $in: neededContactIds }, isDeactivated: { $ne: true } })
+      .select(CONTACT_USER_FIELDS)
+      .lean(),
+    User.find({
+      _id: { $nin: [userObjectId, ...neededContactIds] },
+      isDeactivated: { $ne: true },
+      blockedUsers: { $ne: userObjectId },
+    })
+      .select(CONTACT_USER_FIELDS)
+      .limit(40)
+      .lean(),
+    conversationIds.length > 0
+      ? Message.aggregate([
           { $match: { conversationId: { $in: conversationIds } } },
           { $sort: { createdAt: -1 } },
           { $group: { _id: '$conversationId', doc: { $first: '$$ROOT' } } },
-        ]),
-        Message.aggregate([
-          { $match: { receiverId: userObjectId, isRead: false } },
-          { $group: { _id: '$senderId', count: { $sum: 1 } } },
-        ]),
-      ])
-    : [[], []];
+        ])
+      : Promise.resolve([]),
+    Message.aggregate([
+      { $match: { receiverId: userObjectId, isRead: false } },
+      { $group: { _id: '$senderId', count: { $sum: 1 } } },
+    ]),
+  ]);
+
+  const allUsers = [...contactUsers, ...suggestionUsers];
 
   const lastMessageByPartner = new Map<string, any>();
   for (const row of lastMessageRows) {
@@ -67,8 +83,6 @@ export const getMessageContacts = async (req: Request, res: Response) => {
     unreadByPartner.set(row._id.toString(), row.count);
   }
 
-  const myFriends = toIdStringArray(user.friends);
-  const myBlocked = toIdStringArray(user.blockedUsers);
   const chattedUserIds = new Set(lastMessageByPartner.keys());
 
   const notesPool = [
@@ -142,10 +156,11 @@ export const getConversation = async (req: Request, res: Response) => {
     .sort({ createdAt: 1 })
     .lean();
 
-  await Message.updateMany(
+  // Mark incoming messages as read in the background without holding up the response
+  Message.updateMany(
     { receiverId: user.id, senderId: otherUserId, isRead: false },
     { $set: { isRead: true, seenAt: new Date().toISOString() } }
-  );
+  ).catch(() => {});
 
   return res.json({ messages: messages.map(m => messageService.serializeMessage(m)) });
 };

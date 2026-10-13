@@ -6,6 +6,7 @@
 import { Request, Response } from 'express';
 import { User, Post, Report, MarketplaceItem, Group, Page } from '../models';
 import { authService } from '../services/authService';
+import { clearUserAuthCache } from '../middleware/auth';
 
 export const getAdminMetrics = async (req: Request, res: Response) => {
   const user = req.user!;
@@ -105,6 +106,7 @@ export const toggleUserLock = async (req: Request, res: Response) => {
 
   targetUser.set('isLocked', !targetUser.get('isLocked'));
   await targetUser.save();
+  clearUserAuthCache(targetUser.id);
 
   return res.json({ success: true, isLocked: targetUser.get('isLocked') });
 };
@@ -118,6 +120,7 @@ export const toggleUserVerify = async (req: Request, res: Response) => {
 
   targetUser.set('verifyBadge', !targetUser.get('verifyBadge'));
   await targetUser.save();
+  clearUserAuthCache(targetUser.id);
 
   return res.json({ success: true, verifyBadge: targetUser.get('verifyBadge') });
 };

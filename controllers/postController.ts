@@ -45,13 +45,10 @@ export const getPosts = async (req: Request, res: Response) => {
   if (andClauses.length) query.$and = andClauses;
 
   // Exclude posts from users who are blocked by, or have blocked, the current
-  // user. Both lookups are independent, so run them in parallel instead of as
-  // two sequential round-trips on every feed load.
-  const [me, blockedByOthers] = await Promise.all([
-    User.findById(user.id).select('blockedUsers').lean(),
-    User.find({ blockedUsers: user.id }).select('_id').lean(),
-  ]);
-  const myBlocked = toIdStringArray((me as any)?.blockedUsers);
+  // user. req.user already carries the current user's blockedUsers list from
+  // the auth middleware, avoiding an extra findById round-trip on every feed load.
+  const myBlocked = toIdStringArray(user.blockedUsers);
+  const blockedByOthers = await User.find({ blockedUsers: user.id }).select('_id').lean();
   const excludeIds = [...myBlocked, ...blockedByOthers.map((u: any) => u._id.toString())];
   if (excludeIds.length) query.userId = { ...(query.userId ? { $eq: query.userId } : {}), $nin: excludeIds };
 

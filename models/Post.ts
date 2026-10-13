@@ -42,7 +42,7 @@ PostSchema.index({ text: 'text' });
 // -1 } - without this compound index Mongo has to pull matching documents
 // then sort them in memory on every single feed page load instead of
 // reading them back pre-sorted off an index.
-PostSchema.index({ isPinned: 1, createdAt: -1 });
+PostSchema.index({ isPinned: -1, createdAt: -1 });
 
 PostSchema.plugin(idPlugin);
 

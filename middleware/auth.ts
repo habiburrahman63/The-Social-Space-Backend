@@ -18,6 +18,21 @@ declare global {
   }
 }
 
+interface CachedUser {
+  user: any;
+  cachedAt: number;
+}
+const userAuthCache = new Map<string, CachedUser>();
+const USER_CACHE_TTL_MS = 6000; // 6 seconds TTL
+
+export function clearUserAuthCache(userId?: string) {
+  if (userId) {
+    userAuthCache.delete(userId);
+  } else {
+    userAuthCache.clear();
+  }
+}
+
 // Middleware to verify JWT token
 export async function authenticateToken(req: Request, res: Response, next: NextFunction) {
   const authHeader = req.headers['authorization'];
@@ -39,28 +54,32 @@ export async function authenticateToken(req: Request, res: Response, next: NextF
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET) as { userId: string; email: string };
-    // This runs on EVERY authenticated request, so:
-    //  1. Only pull the exact fields the controllers read off req.user
-    //     (id/username/avatar/badge/role/friends/blockedUsers/status flags).
-    //     A base64 cover photo or featuredPhotos entry can be hundreds of KB
-    //     and is never needed here - shipping it from MongoDB on every request
-    //     (and every Frontend poll) was pure overhead.
-    //  2. Use .lean() so the document isn't hydrated into a full Mongoose
-    //     object on every request - controllers only read plain properties.
-    // Endpoints that must return the heavy fields (e.g. /auth/me, profile
-    // updates) re-fetch the full document themselves.
-    const user: any = await User.findById(decoded.userId)
-      .select('username profilePic verifyBadge role friends blockedUsers isLocked isDeactivated lastActiveAt')
-      .lean()
-      .catch(() => null);
+    
+    // Check short-lived in-memory cache first to avoid hammering MongoDB Atlas on concurrent
+    // parallel requests (e.g. page loads and multi-endpoint polling).
+    const cached = userAuthCache.get(decoded.userId);
+    let user: any = null;
+    if (cached && Date.now() - cached.cachedAt < USER_CACHE_TTL_MS) {
+      user = { ...cached.user };
+    } else {
+      user = await User.findById(decoded.userId)
+        .select('username profilePic verifyBadge role friends blockedUsers isLocked isDeactivated lastActiveAt')
+        .lean()
+        .catch(() => null);
 
-    if (!user) {
-      return res.status(403).json({ error: 'User no longer exists' });
+      if (!user) {
+        userAuthCache.delete(decoded.userId);
+        return res.status(403).json({ error: 'User no longer exists' });
+      }
+
+      user.id = user._id.toString();
+
+      // Store in memory cache (cap cache size to avoid unbounded memory growth)
+      if (userAuthCache.size > 2000) {
+        userAuthCache.clear();
+      }
+      userAuthCache.set(decoded.userId, { user: { ...user }, cachedAt: Date.now() });
     }
-
-    // .lean() results don't run the idPlugin virtual, so expose the same
-    // string `id` the rest of the codebase (and Frontend) expects.
-    user.id = user._id.toString();
 
     if (user.isLocked) {
       return res.status(403).json({ error: 'Account is locked. Please reset your password.' });
