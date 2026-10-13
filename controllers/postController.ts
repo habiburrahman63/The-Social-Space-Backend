@@ -4,6 +4,7 @@
  */
 
 import { Request, Response } from 'express';
+import mongoose from 'mongoose';
 import { Post, Comment, User, Notification } from '../models';
 import { userService } from '../services/userService';
 import { notificationService } from '../services/notificationService';
@@ -13,7 +14,7 @@ import { escapeRegex } from '../utils/regex';
 
 export const getPosts = async (req: Request, res: Response) => {
   const user = req.user!;
-  const { filter, userId, pageId, groupId, q, page, limit, includeComments, scope } = req.query;
+  const { filter, userId, pageId, groupId, q, page, limit, includeComments, scope, refresh, since, seenIds, rotateOffset } = req.query;
 
   const query: any = {
     // Exclude scheduled/draft posts unless they belong to the current user.
@@ -48,6 +49,9 @@ export const getPosts = async (req: Request, res: Response) => {
 
   const pageNum = Math.max(1, parseInt(String(page || '1'), 10) || 1);
   const limitNum = Math.min(100, Math.max(1, parseInt(String(limit || '50'), 10) || 50));
+  const withComments = includeComments !== '0' && includeComments !== 'false';
+  const isGeneralFeed = !userId && !pageId && !groupId && !q && scope !== 'own';
+  const isRefresh = refresh === '1' || refresh === 'true';
 
   if (userId) {
     const targetUserIdStr = String(userId);
@@ -97,12 +101,154 @@ export const getPosts = async (req: Request, res: Response) => {
   }
 
   if (andClauses.length) query.$and = andClauses;
+
+  // Parse seenIds for smart feed deduplication and dynamic rotation
+  const rawSeenIds = typeof seenIds === 'string'
+    ? seenIds.split(',').map(s => s.trim()).filter(Boolean)
+    : Array.isArray(seenIds)
+      ? (seenIds as string[]).map(s => String(s).trim()).filter(Boolean)
+      : [];
+  const validSeenObjectIds = rawSeenIds
+    .filter(id => mongoose.isValidObjectId(id))
+    .map(id => new mongoose.Types.ObjectId(id));
+
+  // Smart dynamic refresh algorithm for Home Feed
+  if (isGeneralFeed && isRefresh) {
+    // Fetch pinned posts first (always prioritized at index 0)
+    const pinnedPosts = await Post.find({
+      ...query,
+      isPinned: true,
+    })
+      .sort({ createdAt: -1 })
+      .populate('userId', 'username profilePic verifyBadge')
+      .lean();
+
+    const pinnedIds = pinnedPosts.map((p: any) => p._id);
+
+    // 1. Check for brand new posts created after `since`
+    let newPosts: any[] = [];
+    if (since) {
+      const sinceDate = new Date(String(since));
+      if (!isNaN(sinceDate.getTime())) {
+        newPosts = await Post.find({
+          ...query,
+          isPinned: { $ne: true },
+          createdAt: { $gt: sinceDate },
+          _id: { $nin: pinnedIds },
+        })
+          .sort({ createdAt: -1 })
+          .limit(limitNum)
+          .populate('userId', 'username profilePic verifyBadge')
+          .lean();
+      }
+    }
+
+    if (newPosts.length > 0) {
+      const finalPosts = [...pinnedPosts, ...newPosts];
+      const enrichedPosts = await postService.serializePostsBatch(finalPosts, { withComments });
+      return res.json({
+        posts: enrichedPosts,
+        newCount: newPosts.length,
+        rotatedCount: 0,
+        isRefresh: true,
+        page: 1,
+        limit: limitNum,
+        hasMore: true,
+      });
+    }
+
+    // 2. If no new posts, surface unseen older posts that the user hasn't seen yet
+    let unseenOlderPosts: any[] = [];
+    if (validSeenObjectIds.length > 0) {
+      const excludeSeenAndPinned = [...validSeenObjectIds, ...pinnedIds];
+      unseenOlderPosts = await Post.find({
+        ...query,
+        isPinned: { $ne: true },
+        _id: { $nin: excludeSeenAndPinned },
+      })
+        .sort({ createdAt: -1 })
+        .limit(limitNum)
+        .populate('userId', 'username profilePic verifyBadge')
+        .lean();
+    }
+
+    if (unseenOlderPosts.length > 0) {
+      const finalPosts = [...pinnedPosts, ...unseenOlderPosts];
+      const enrichedPosts = await postService.serializePostsBatch(finalPosts, { withComments });
+      return res.json({
+        posts: enrichedPosts,
+        newCount: 0,
+        rotatedCount: unseenOlderPosts.length,
+        isRefresh: true,
+        page: 1,
+        limit: limitNum,
+        hasMore: true,
+      });
+    }
+
+    // 3. If all posts in the database have already been seen in this session,
+    // rotate the existing pool so older posts cycle up to the top dynamically
+    const allCandidatePosts = await Post.find({
+      ...query,
+      isPinned: { $ne: true },
+      _id: { $nin: pinnedIds },
+    })
+      .sort({ createdAt: -1 })
+      .limit(Math.max(50, limitNum * 2))
+      .populate('userId', 'username profilePic verifyBadge')
+      .lean();
+
+    let rotatedPool: any[] = [];
+    if (allCandidatePosts.length > 1) {
+      const parsedOffset = parseInt(String(rotateOffset || '1'), 10) || 1;
+      const step = Math.max(1, Math.min(allCandidatePosts.length - 1, parsedOffset % allCandidatePosts.length || 1));
+      rotatedPool = [
+        ...allCandidatePosts.slice(step),
+        ...allCandidatePosts.slice(0, step),
+      ].slice(0, limitNum);
+    } else {
+      rotatedPool = allCandidatePosts;
+    }
+
+    const finalPosts = [...pinnedPosts, ...rotatedPool];
+    const enrichedPosts = await postService.serializePostsBatch(finalPosts, { withComments });
+    return res.json({
+      posts: enrichedPosts,
+      newCount: 0,
+      rotatedCount: rotatedPool.length,
+      isRefresh: true,
+      isCirculated: true,
+      page: 1,
+      limit: limitNum,
+      hasMore: allCandidatePosts.length > limitNum,
+    });
+  }
+
+  // Deduplicated pagination for infinite scroll in general feed
+  if (isGeneralFeed && pageNum > 1 && validSeenObjectIds.length > 0) {
+    const paginatedPosts = await Post.find({
+      ...query,
+      isPinned: { $ne: true },
+      _id: { $nin: validSeenObjectIds },
+    })
+      .sort({ createdAt: -1 })
+      .limit(limitNum + 1)
+      .populate('userId', 'username profilePic verifyBadge')
+      .lean();
+
+    const hasMore = paginatedPosts.length > limitNum;
+    const sliced = paginatedPosts.slice(0, limitNum);
+    const enrichedPosts = await postService.serializePostsBatch(sliced, { withComments });
+    return res.json({ posts: enrichedPosts, page: pageNum, limit: limitNum, hasMore });
+  }
+
+  // Standard skip/limit query fallback (initial load, profiles, pages, groups, search)
   const skip = (pageNum - 1) * limitNum;
 
   const posts = await Post.find(query)
     .sort({ isPinned: -1, createdAt: -1 })
     .skip(skip)
-    .limit(limitNum)
+    .limit(limitNum + 1)
     .populate('userId', 'username profilePic verifyBadge')
     // NOTE: pollOptions.votes is deliberately NOT populated - serializePostsBatch
     // only needs the voter ids, and toIdStringArray already handles raw
@@ -110,14 +256,11 @@ export const getPosts = async (req: Request, res: Response) => {
     // that gets flattened away anyway.
     .lean();
 
-  // `includeComments=0` lets a list view fetch just the posts (plus a comment
-  // count) and load one post's comments only when its comment tray is opened.
-  // It defaults to true, so existing consumers (e.g. the Profile page) are
-  // completely unaffected.
-  const withComments = includeComments !== '0' && includeComments !== 'false';
-  const enrichedPosts = await postService.serializePostsBatch(posts, { withComments });
+  const hasMore = posts.length > limitNum;
+  const sliced = posts.slice(0, limitNum);
+  const enrichedPosts = await postService.serializePostsBatch(sliced, { withComments });
 
-  return res.json({ posts: enrichedPosts, page: pageNum, limit: limitNum, hasMore: posts.length === limitNum });
+  return res.json({ posts: enrichedPosts, page: pageNum, limit: limitNum, hasMore });
 };
 
 /**
